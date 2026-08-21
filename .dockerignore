@@ -1,0 +1,63 @@
+# =========================================
+# CleanMark AI - Backend .dockerignore
+# =========================================
+
+# Git & Version Control
+.git/
+.gitignore
+.gitattributes
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Environment Files & Secrets
+.env
+.env.*
+!.env.example
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+tests/
+test_outputs/
+
+# Temporary Files, Logs & Scratch Artifacts
+*.log
+logs/
+temp/
+uploads/
+outputs/
+scratch/
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.zip
+*.tar.gz
+
+# IDE & Editor Settings
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Documentation & Markdown
+README.md
+*.md
