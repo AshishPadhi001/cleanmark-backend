@@ -432,41 +432,40 @@ class GeminiUnblendEngine:
         std_veo_x = max(0, w - margin - expected_size - 24)
         std_veo_y = max(0, h - margin - expected_size - 24)
 
-        # 1. Determine Position & Size
+        # 1. Determine Position & Size (Universal for 16:9, 9:16, 1:1, etc.)
         if custom_box is not None and custom_box.get("w", 0) > 0:
-            bw = custom_box.get("w", 0)
-            bh = custom_box.get("h", 0)
-            if bw <= 1.0:
+            bw_val = custom_box.get("w", 0)
+            bh_val = custom_box.get("h", 0)
+            if bw_val <= 1.0:
                 bx1 = int(custom_box["x"] * w)
                 by1 = int(custom_box["y"] * h)
-                bx2 = int((custom_box["x"] + bw) * w)
-                by2 = int((custom_box["y"] + bh) * h)
+                bx2 = int((custom_box["x"] + bw_val) * w)
+                by2 = int((custom_box["y"] + bh_val) * h)
             else:
                 bx1 = int(custom_box["x"])
                 by1 = int(custom_box["y"])
-                bx2 = bx1 + int(bw)
-                by2 = by1 + int(bh)
+                bx2 = bx1 + int(bw_val)
+                by2 = by1 + int(bh_val)
 
-            # Check if the user's box encompasses the standard bottom-right Veo position:
-            is_bottom_right = (bx1 <= std_veo_x + 30 and bx2 >= std_veo_x and by1 <= std_veo_y + 30 and by2 >= std_veo_y)
+            # Center expected watermark star on the user's box center:
+            center_x = (bx1 + bx2) // 2
+            center_y = (by1 + by2) // 2
+            wm_size = expected_size
 
-            if is_bottom_right:
-                # Use exact deterministic Veo formula coordinates (avoids false noise lock from template matching)
+            # If user's box center is close to standard Veo corner (within 40px), snap to exact Veo formula:
+            if abs(center_x - (std_veo_x + expected_size // 2)) <= 40 and abs(center_y - (std_veo_y + expected_size // 2)) <= 40:
                 wm_x = std_veo_x
                 wm_y = std_veo_y
-                wm_size = expected_size
-                logger.info(f"[VIDEO] Locked to exact Veo formula coordinates: ({wm_x},{wm_y}) size={wm_size}")
+                logger.info(f"[VIDEO] Snapped to exact Veo coordinates ({w}x{h}): ({wm_x},{wm_y}) size={wm_size}")
             else:
-                # User drew a box in a different area (e.g. top-left or top-right): center the expected watermark inside the box
-                wm_size = expected_size
-                wm_x = max(0, min(w - wm_size, bx1 + max(0, (bx2 - bx1 - wm_size) // 2)))
-                wm_y = max(0, min(h - wm_size, by1 + max(0, (by2 - by1 - wm_size) // 2)))
-                logger.info(f"[VIDEO] Custom box watermark geometry: ({wm_x},{wm_y}) size={wm_size}")
+                wm_x = max(0, min(w - wm_size, center_x - wm_size // 2))
+                wm_y = max(0, min(h - wm_size, center_y - wm_size // 2))
+                logger.info(f"[VIDEO] Centered on custom box ({bx1},{by1} to {bx2},{by2}) -> ({wm_x},{wm_y}) size={wm_size}")
         else:
             wm_x = std_veo_x
             wm_y = std_veo_y
             wm_size = expected_size
-            logger.info(f"[VIDEO] Veo standard geometry: ({wm_x},{wm_y}) size={wm_size}")
+            logger.info(f"[VIDEO] Veo standard geometry ({w}x{h}): ({wm_x},{wm_y}) size={wm_size}")
 
         alpha_tmpl = self._get_alpha_template(wm_size)
         if alpha_tmpl is None:

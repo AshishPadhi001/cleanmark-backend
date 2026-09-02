@@ -22,8 +22,20 @@ logger = logging.getLogger("cleanmark.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    import shutil
     settings.init_directories()
-    (settings.STORAGE_DIR / "videos").mkdir(parents=True, exist_ok=True)
+    v_dir = settings.STORAGE_DIR / "videos"
+    v_dir.mkdir(parents=True, exist_ok=True)
+    # Purge any old video files on startup
+    for item in v_dir.iterdir():
+        try:
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+        except Exception:
+            pass
+    logger.info("🧹 [STARTUP] Purged all stale video storage on startup.")
     logger.info("⚡ [STARTUP] CleanMark Mathematical Engine Initialized (0 Blur, Zero-PyTorch)")
     image_service.initialize_on_startup()
     yield

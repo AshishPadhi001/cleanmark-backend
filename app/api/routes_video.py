@@ -1,66 +1,175 @@
-import os
-import io
-import time
-import json
-import uuid
 import asyncio
+import json
 import logging
-from pathlib import Path
-from typing import Optional
+import os
+import shutil
+import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+from typing import Optional, Dict, Any, List
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, File, UploadFile, Form, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
 
+from app.core.config import settings
 from app.services.video_service import video_service
 from app.utils.mask_utils import decode_mask_bytes
-from app.core.config import settings
 
-logger = logging.getLogger("cleanmark.routes_video")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("cleanmark.video")
 
-router = APIRouter(prefix="/api/video", tags=["Video Watermark Removal"])
+router = APIRouter(prefix="/video", tags=["video"])
 
 VIDEO_STORAGE = settings.STORAGE_DIR / "videos"
 VIDEO_STORAGE.mkdir(parents=True, exist_ok=True)
 
-# Dedicated ThreadPoolExecutor for true concurrent video processing
-VIDEO_EXECUTOR = ThreadPoolExecutor(max_workers=6, thread_name_prefix="video_worker")
+# Maximum worker threads for parallel multi-core rendering
+VIDEO_EXECUTOR = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
+
+def get_session_dir(session_id: Optional[str] = None, purge_existing: bool = False) -> Path:
+    """
+    Returns or creates an isolated session directory under storage/videos/.
+    If purge_existing is True, clears any previous files from this session.
+    """
+    clean_sid = (session_id or "").strip()
+    if not clean_sid or "/" in clean_sid or "\\" in clean_sid or ".." in clean_sid:
+        clean_sid = str(uuid.uuid4())
+    s_dir = VIDEO_STORAGE / clean_sid
+
+    if purge_existing and s_dir.exists():
+        try:
+            shutil.rmtree(s_dir, ignore_errors=True)
+            logger.info(f"🔄 [SESSION RESET] Cleared previous files in session: {clean_sid}")
+        except Exception:
+            pass
+
+    s_dir.mkdir(parents=True, exist_ok=True)
+    return s_dir
+
+
+def cleanup_session_folder(target_path: Path):
+    """Deletes session folder and all temporary video files as soon as user downloads."""
+    try:
+        if not target_path.exists():
+            return
+        parent = target_path.parent
+        # If inside a session subdirectory under VIDEO_STORAGE, remove the entire session folder
+        if parent != VIDEO_STORAGE and parent.parent == VIDEO_STORAGE and parent.is_dir():
+            shutil.rmtree(parent, ignore_errors=True)
+            logger.info(f"🗑️ [AUTO-CLEANUP] Deleted session directory: {parent.name}")
+        else:
+            target_path.unlink(missing_ok=True)
+            # Remove corresponding input files
+            stem_base = target_path.stem.replace("_cleaned", "")
+            for inp in target_path.parent.glob(f"{stem_base}_input.*"):
+                inp.unlink(missing_ok=True)
+            logger.info(f"🗑️ [AUTO-CLEANUP] Deleted video files: {target_path.name}")
+    except Exception as e:
+        logger.warning(f"Error during auto-cleanup: {e}")
+
+
+def cleanup_stale_sessions(max_age_seconds: int = 300):
+    """Background garbage collector: removes any abandoned session older than 5 minutes."""
+    try:
+        now = time.time()
+        for item in VIDEO_STORAGE.iterdir():
+            if item.is_dir():
+                try:
+                    mtime = item.stat().st_mtime
+                    if now - mtime > max_age_seconds:
+                        shutil.rmtree(item, ignore_errors=True)
+                        logger.info(f"🧹 [TTL CLEANUP] Removed expired session: {item.name}")
+                except Exception:
+                    pass
+            elif item.is_file() and item.suffix == ".mp4":
+                try:
+                    if now - item.stat().st_mtime > max_age_seconds:
+                        item.unlink(missing_ok=True)
+                except Exception:
+                    pass
+    except Exception as e:
+        logger.debug(f"TTL cleanup exception: {e}")
+
+
+
+@router.post("/session/init")
+@router.post("/sessions/purge-all")
+async def init_session_or_purge_all(session_id: Optional[str] = Form(None)):
+    """
+    Called when frontend mounts / reloads / starts a new session:
+    Purges any stale or orphaned sessions in storage/videos/ and registers new clean session.
+    """
+    deleted = 0
+    clean_sid = (session_id or "").strip()
+    for item in VIDEO_STORAGE.iterdir():
+        if item.is_dir() and item.name != clean_sid:
+            try:
+                shutil.rmtree(item, ignore_errors=True)
+                deleted += 1
+            except Exception:
+                pass
+        elif item.is_file():
+            try:
+                item.unlink(missing_ok=True)
+                deleted += 1
+            except Exception:
+                pass
+
+    new_session_dir = get_session_dir(clean_sid, purge_existing=True)
+    logger.info(f"🔄 [SESSION INIT] Initialized session: {new_session_dir.name} (purged {deleted} old sessions)")
+    return {"status": "ok", "session_id": new_session_dir.name, "purged": deleted}
 
 @router.post("/info")
-async def get_video_info(video: UploadFile = File(...)):
-    """Uploads a video and returns its technical metadata and first frame preview."""
-    try:
-        video_id = str(uuid.uuid4())
-        ext = Path(video.filename or "video.mp4").suffix or ".mp4"
-        input_path = VIDEO_STORAGE / f"{video_id}_input{ext}"
+async def get_video_info(
+    video: UploadFile = File(...),
+    session_id: Optional[str] = Form(None)
+):
+    """
+    Extracts video metadata (fps, frame count, dimensions, duration, and first frame preview)
+    and saves to an isolated session directory. Automatically clears any previous session files.
+    """
+    # Trigger background cleanup of stale sessions
+    asyncio.get_event_loop().run_in_executor(None, cleanup_stale_sessions)
 
+    # When a new video upload happens, reset/purge previous session video files
+    session_dir = get_session_dir(session_id, purge_existing=True)
+    vid_id = str(uuid.uuid4())
+    ext = Path(video.filename or "video.mp4").suffix or ".mp4"
+    temp_path = session_dir / f"{vid_id}_input{ext}"
+
+    try:
         content = await video.read()
-        with open(input_path, "wb") as f:
+        with open(temp_path, "wb") as f:
             f.write(content)
 
-        metadata = video_service.get_video_metadata(str(input_path))
-        metadata["video_id"] = video_id
+        metadata = video_service.get_video_metadata(str(temp_path))
+        metadata["video_id"] = vid_id
+        metadata["session_id"] = session_dir.name
         metadata["filename"] = video.filename
 
+        logger.info(f"📹 [VIDEO INFO] session={session_dir.name} id={vid_id} {metadata.get('width')}x{metadata.get('height')} @ {metadata.get('fps')}fps ({metadata.get('frame_count')} frames)")
         return metadata
+
     except Exception as e:
-        logger.error(f"Error reading video info: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Failed to read video metadata: {e}", exc_info=True)
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"Invalid or corrupted video file: {str(e)}")
 
 
 @router.post("/clean")
 async def clean_video_stream(
     video: Optional[UploadFile] = File(None),
     video_id: Optional[str] = Form(None),
+    session_id: Optional[str] = Form(None),
     mask: Optional[UploadFile] = File(None),
     mask_base64: Optional[str] = Form(None),
     preset: Optional[str] = Form(None),
     removal_mode: str = Form("unblend"),
-    unblend_gain: float = Form(-1.0),  # -1 = AUTO gain solver
+    unblend_gain: float = Form(-1.0),
     offset_x: int = Form(-24),
     offset_y: int = Form(-24),
     size_scale: float = Form(1.0),
@@ -74,24 +183,37 @@ async def clean_video_stream(
 ):
     """
     Cleans watermark from video with true parallel multi-threaded SSE streaming.
-    Supports ultra-fast 100% mathematical alpha unblending ('unblend') and deep neural inpainting ('inpaint').
+    Saves in session directory and emits streaming progress events.
     """
     try:
-        logger.info(f"➡️ [API VIDEO CLEAN] mode={removal_mode}, unblend_gain={unblend_gain}, box=({box_x}, {box_y}, {box_w}, {box_h}), time={start_sec}..{end_sec}")
+        session_dir = get_session_dir(session_id, purge_existing=False)
+
+        logger.info(f"➡️ [API VIDEO CLEAN] session={session_dir.name}, mode={removal_mode}, unblend_gain={unblend_gain}, box=({box_x}, {box_y}, {box_w}, {box_h}), time={start_sec}..{end_sec}")
+
         # Determine input video path
-        if video is not None:
+        if video_id:
+            vid_id = video_id
+            matches = list(session_dir.glob(f"{video_id}_input.*"))
+            if not matches:
+                matches = list(VIDEO_STORAGE.glob(f"**/{video_id}_input.*"))
+            if matches:
+                input_path = matches[0]
+                session_dir = input_path.parent
+            elif video is not None:
+                ext = Path(video.filename or "video.mp4").suffix or ".mp4"
+                input_path = session_dir / f"{vid_id}_input{ext}"
+                content = await video.read()
+                with open(input_path, "wb") as f:
+                    f.write(content)
+            else:
+                raise HTTPException(status_code=404, detail="Uploaded video session not found.")
+        elif video is not None:
             vid_id = str(uuid.uuid4())
             ext = Path(video.filename or "video.mp4").suffix or ".mp4"
-            input_path = VIDEO_STORAGE / f"{vid_id}_input{ext}"
+            input_path = session_dir / f"{vid_id}_input{ext}"
             content = await video.read()
             with open(input_path, "wb") as f:
                 f.write(content)
-        elif video_id:
-            vid_id = video_id
-            matches = list(VIDEO_STORAGE.glob(f"{video_id}_input.*"))
-            if not matches:
-                raise HTTPException(status_code=404, detail="Uploaded video session not found.")
-            input_path = matches[0]
         else:
             raise HTTPException(status_code=400, detail="No video uploaded or video_id provided.")
 
@@ -99,7 +221,7 @@ async def clean_video_stream(
         width = metadata["width"]
         height = metadata["height"]
 
-        # Build mask numpy array (H, W) if needed for inpaint mode
+        # Build mask numpy array if needed for inpainting
         mask_np = np.zeros((height, width), dtype=np.uint8)
         custom_box = None
 
@@ -123,27 +245,10 @@ async def clean_video_stream(
             raw_bytes = base64.b64decode(mask_base64)
             uploaded_mask = decode_mask_bytes(raw_bytes)
             mask_np = cv2.resize(uploaded_mask, (width, height), interpolation=cv2.INTER_NEAREST)
-        elif preset:
-            p = preset.lower().strip()
-            bw = int(width * 0.22)
-            bh = int(height * 0.10)
-            pad_x = int(width * 0.03)
-            pad_y = int(height * 0.03)
 
-            if p == "top-left":
-                mask_np[pad_y:pad_y + bh, pad_x:pad_x + bw] = 255
-            elif p == "top-right":
-                mask_np[pad_y:pad_y + bh, width - pad_x - bw:width - pad_x] = 255
-            elif p == "bottom-left":
-                mask_np[height - pad_y - bh:height - pad_y, pad_x:pad_x + bw] = 255
-            elif p == "bottom-right":
-                mask_np[height - pad_y - bh:height - pad_y, width - pad_x - bw:width - pad_x] = 255
-            elif p == "bottom-banner":
-                mask_np[height - int(height * 0.14):height, :] = 255
+        output_video_path = str(session_dir / f"{vid_id}_cleaned.mp4")
 
-        output_video_path = str(VIDEO_STORAGE / f"{vid_id}_cleaned.mp4")
-
-        # Offload synchronous frame processing to background OS ThreadPoolExecutor
+        # Offload frame processing to background OS ThreadPoolExecutor
         async def parallel_event_stream():
             loop = asyncio.get_running_loop()
             q = asyncio.Queue()
@@ -168,7 +273,6 @@ async def clean_video_stream(
                     logger.error(f"Worker video processing error: {exc}", exc_info=True)
                     asyncio.run_coroutine_threadsafe(q.put({"status": "error", "message": str(exc)}), loop)
                 finally:
-                    # Signal EOF
                     asyncio.run_coroutine_threadsafe(q.put(None), loop)
 
             loop.run_in_executor(VIDEO_EXECUTOR, sync_worker)
@@ -180,6 +284,7 @@ async def clean_video_stream(
 
                 if item.get("status") == "completed":
                     item["video_id"] = vid_id
+                    item["session_id"] = session_dir.name
                     item["download_url"] = f"/api/video/download/{vid_id}"
                     item["stream_url"] = f"/api/video/stream/{vid_id}"
 
@@ -205,13 +310,20 @@ async def clean_video_stream(
 
 
 @router.get("/download/{video_id}")
-async def download_cleaned_video(video_id: str):
-    """Downloads the cleaned MP4 video file."""
-    matches = list(VIDEO_STORAGE.glob(f"{video_id}_cleaned.mp4"))
+async def download_cleaned_video(video_id: str, background_tasks: BackgroundTasks):
+    """
+    Downloads the cleaned MP4 video file and immediately clears/deletes
+    the session storage files as soon as the download finishes.
+    """
+    matches = list(VIDEO_STORAGE.glob(f"**/{video_id}_cleaned.mp4"))
     if not matches:
-        raise HTTPException(status_code=404, detail="Cleaned video not found or processing still underway.")
+        raise HTTPException(status_code=404, detail="Cleaned video not found or already downloaded and cleared.")
 
     path = matches[0]
+
+    # Queue immediate background deletion of session files as soon as download stream completes
+    background_tasks.add_task(cleanup_session_folder, path)
+
     return FileResponse(
         path,
         media_type="video/mp4",
@@ -222,9 +334,33 @@ async def download_cleaned_video(video_id: str):
 @router.get("/stream/{video_id}")
 async def stream_cleaned_video(video_id: str):
     """Streams the cleaned MP4 video file for HTML5 video playback."""
-    matches = list(VIDEO_STORAGE.glob(f"{video_id}_cleaned.mp4"))
+    matches = list(VIDEO_STORAGE.glob(f"**/{video_id}_cleaned.mp4"))
     if not matches:
         raise HTTPException(status_code=404, detail="Cleaned video not found.")
 
     path = matches[0]
     return FileResponse(path, media_type="video/mp4")
+
+
+@router.delete("/session/{session_id}/clear")
+@router.delete("/cleanup/{video_id}")
+async def cleanup_video_endpoint(session_id: Optional[str] = None, video_id: Optional[str] = None):
+    """Explicitly deletes all session files when user resets, leaves, or navigates back."""
+    deleted = 0
+    if session_id:
+        s_dir = VIDEO_STORAGE / session_id
+        if s_dir.exists() and s_dir != VIDEO_STORAGE:
+            shutil.rmtree(s_dir, ignore_errors=True)
+            logger.info(f"🗑️ [SESSION CLEAR] Removed session folder: {session_id}")
+            deleted += 1
+
+    if video_id:
+        matches = list(VIDEO_STORAGE.glob(f"**/{video_id}*.*"))
+        for m in matches:
+            try:
+                cleanup_session_folder(m)
+                deleted += 1
+            except Exception:
+                pass
+
+    return {"status": "ok", "deleted_items": deleted}
