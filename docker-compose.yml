@@ -16,6 +16,8 @@ services:
       - PORT=8000
       - PYTHONUNBUFFERED=1
     volumes:
+      # Live code sync so code edits apply immediately
+      - ./app:/app/app
       # Persist downloaded AI model weights locally so they aren't redownloaded
       - ./models:/app/models
       # Persist uploads and outputs

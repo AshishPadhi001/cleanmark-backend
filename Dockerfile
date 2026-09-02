@@ -1,11 +1,11 @@
-# CleanMark FastAPI Backend Dockerfile
+# CleanMark FastAPI Backend Dockerfile (Ultra-Lightweight Mathematical Engine)
 FROM python:3.11-slim
 
 # Prevent Python from writing .pyc files and enable unbuffered output
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Install system dependencies required for OpenCV, FFmpeg and PyTorch
+# Install system dependencies required for OpenCV and FFmpeg
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libgl1 \
@@ -15,18 +15,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Install Python dependencies
+# Install lightweight Python dependencies (No PyTorch)
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copy backend application source code
+# Copy reference alpha templates and backend application source code
+COPY models ./models
 COPY app ./app
 COPY run.py .
 COPY test_backend.py .
 
-# Create storage and models directories
-RUN mkdir -p /app/models /app/storage/uploads /app/storage/outputs /app/storage/temp
+# Create storage directories
+RUN mkdir -p /app/storage/uploads /app/storage/outputs /app/storage/videos /app/storage/temp
 
 # Expose FastAPI port
 EXPOSE 8000

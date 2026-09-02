@@ -5,45 +5,28 @@ import base64
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional, List
+from typing import Optional, List, Union
 from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
-from fastapi.responses import Response, JSONResponse
+from fastapi import APIRouter, Request, HTTPException
+from fastapi.responses import JSONResponse
 
 from app.services.image_service import image_service
 from app.utils.mask_utils import decode_image_bytes, decode_mask_bytes
 from app.core.config import settings
 
-logger = logging.getLogger("cleanmark.routes")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("cleanmark.routes_image")
 
-router = APIRouter()
+router = APIRouter(tags=["Image Watermark Removal"])
+batch_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="cleanmark_worker")
 
-# Optimal worker pool (2 concurrent CPU workers to prevent thread contention on CPU)
-cpu_workers = max(1, min(2, (os.cpu_count() or 4) // 2))
-batch_executor = ThreadPoolExecutor(max_workers=cpu_workers, thread_name_prefix="cleanmark_worker")
-
-@router.get("/health")
-@router.get("/api/health")
-async def health_check():
-    """Health check endpoint for Docker & frontend connection verification."""
-    return {
-        "status": "online",
-        "device": image_service.device,
-        "model_ready": image_service.is_model_ready(),
-        "is_downloading": image_service.is_downloading,
-        "download_progress": image_service.download_progress,
-        "version": settings.VERSION
-    }
 
 def _fast_encode_image(image_rgb: np.ndarray, orig_filename: str = "") -> tuple[str, str, float]:
-    """High-speed image encoder."""
     t0 = time.perf_counter()
     image_bgr = cv2.cvtColor(image_rgb, cv2.COLOR_RGB2BGR)
-    
+
     ext = Path(orig_filename).suffix.lower() if orig_filename else ".jpg"
     if ext in [".png", ".webp"]:
         success, buf = cv2.imencode(".png", image_bgr, [cv2.IMWRITE_PNG_COMPRESSION, 1])
@@ -60,157 +43,206 @@ def _fast_encode_image(image_rgb: np.ndarray, orig_filename: str = "") -> tuple[
     encode_ms = (time.perf_counter() - t0) * 1000
     return data_url, mime, round(encode_ms, 2)
 
-def _sync_inpaint_worker(
+
+def _sync_clean_worker(
     image_bytes: bytes,
-    mask_bytes: bytes,
-    filename: str,
-    dilation: int,
-    use_fallback: bool
+    mask_bytes: Optional[bytes] = None,
+    mask_base64: Optional[str] = None,
+    preset: Optional[str] = None,
+    box_x: Optional[float] = None,
+    box_y: Optional[float] = None,
+    box_w: Optional[float] = None,
+    box_h: Optional[float] = None,
+    gain: float = -1.0,  # -1 = AUTO gain solver
+    size_scale: float = 1.0,
+    filename: str = "image.jpg"
 ) -> dict:
-    """Synchronous CPU inpaint worker with clean microsecond telemetry."""
     t_start = time.perf_counter()
     breakdown = {}
 
-    # 1. Decode arrays
     t_dec0 = time.perf_counter()
-    image_np = decode_image_bytes(image_bytes)
-    h, w = image_np.shape[:2]
-    mask_np = decode_mask_bytes(mask_bytes, target_shape=(h, w))
+    image_rgb = decode_image_bytes(image_bytes)
+    h, w = image_rgb.shape[:2]
     breakdown["decode_ms"] = round((time.perf_counter() - t_dec0) * 1000, 2)
 
-    # 2. Inpaint
-    result_np, method, _, service_timings = image_service.inpaint(
-        image_np=image_np,
+    mask_np = None
+    if mask_bytes and len(mask_bytes) > 0:
+        mask_np = decode_mask_bytes(mask_bytes, target_shape=(h, w))
+    elif mask_base64 and mask_base64 != "undefined":
+        if "," in mask_base64:
+            mask_base64 = mask_base64.split(",")[1]
+        raw = base64.b64decode(mask_base64)
+        mask_np = decode_mask_bytes(raw, target_shape=(h, w))
+
+    custom_box = None
+    if box_x is not None and box_y is not None and box_w is not None and box_h is not None:
+        custom_box = {"x": float(box_x), "y": float(box_y), "w": float(box_w), "h": float(box_h)}
+
+    cleaned_rgb, method, elapsed_sec, service_timings = image_service.inpaint(
+        image_rgb=image_rgb,
         mask_np=mask_np,
-        dilation=dilation,
-        use_fallback=use_fallback
+        preset=preset if preset != "undefined" else None,
+        custom_box=custom_box,
+        gain=float(gain) if gain is not None else -1.0,
+        size_scale=float(size_scale) if size_scale else 1.0
     )
     breakdown.update(service_timings)
 
-    # 3. Encode
-    data_url, mime, encode_ms = _fast_encode_image(result_np, orig_filename=filename)
+    data_url, mime, encode_ms = _fast_encode_image(cleaned_rgb, orig_filename=filename)
     breakdown["base64_encode_ms"] = encode_ms
 
     total_elapsed = time.perf_counter() - t_start
     breakdown["total_roundtrip_ms"] = round(total_elapsed * 1000, 2)
-    infer_sec = round(breakdown.get("total_inference_ms", total_elapsed * 1000) / 1000, 2)
 
-    logger.info(
-        f"[Processed: {filename}] AI Inpaint: {infer_sec}s | "
-        f"Total: {round(total_elapsed, 2)}s | Method: {method}"
-    )
+    logger.info(f"✨ [{filename}] {w}x{h} | Math Unblend: {elapsed_sec*1000:.2f}ms | Total: {total_elapsed*1000:.2f}ms (Zero Blur)")
 
     return {
         "filename": filename,
         "width": w,
         "height": h,
         "method": method,
-        "inference_seconds": infer_sec,
-        "elapsed_seconds": round(total_elapsed, 2),
+        "inference_seconds": round(elapsed_sec, 4),
+        "elapsed_seconds": round(total_elapsed, 4),
         "timings": breakdown,
-        "image_data": data_url
+        "image_data": data_url,
+        "cleaned_image": data_url,
+        "result_b64": data_url
     }
 
-async def _process_single_image_task(
-    image_file: UploadFile,
-    mask_file: UploadFile,
-    dilation: int,
-    use_fallback: bool
-) -> dict:
-    """Async wrapper that delegates CPU-bound inpainting to worker pool."""
-    image_bytes = await image_file.read()
-    mask_bytes = await mask_file.read()
-    loop = asyncio.get_running_loop()
 
-    return await loop.run_in_executor(
-        batch_executor,
-        _sync_inpaint_worker,
-        image_bytes,
-        mask_bytes,
-        image_file.filename or "photo.jpg",
-        dilation,
-        use_fallback
-    )
-
+@router.post("/image/clean")
 @router.post("/process/image")
-async def process_image(
-    image: Optional[UploadFile] = File(None),
-    mask: Optional[UploadFile] = File(None),
-    dilation: int = Form(3),
-    use_fallback: bool = Form(False),
-    return_base64: bool = Form(True)
-):
-    """Single-image inpainting endpoint with high-resolution telemetry."""
-    if not image or not mask:
-        raise HTTPException(status_code=400, detail="Must provide both 'image' and 'mask' multipart files.")
+async def clean_image_endpoint(request: Request):
+    """
+    Robust single-image watermark removal endpoint.
+    Extracts all form fields dynamically without Pydantic 422 type mismatches.
+    """
+    form = await request.form()
+
+    # Find image file from form
+    target_image = form.get("image") or form.get("file") or form.get("image_file")
+    if not target_image or not hasattr(target_image, "read"):
+        logger.error("❌ [400] No valid image file found in multipart form-data.")
+        raise HTTPException(status_code=400, detail="No image file provided. Please upload an image.")
+
+    target_mask = form.get("mask") or form.get("mask_file")
+    mask_base64 = form.get("mask_base64")
+    preset = form.get("preset")
+
+    def parse_float(val):
+        try:
+            return float(val) if val not in (None, "", "undefined", "null") else None
+        except Exception:
+            return None
+
+    box_x = parse_float(form.get("box_x"))
+    box_y = parse_float(form.get("box_y"))
+    box_w = parse_float(form.get("box_w"))
+    box_h = parse_float(form.get("box_h"))
+    gain = (parse_float(form.get("gain")) if form.get("gain") is not None else -1.0)
+    size_scale = parse_float(form.get("size_scale")) or 1.0
 
     try:
-        res = await _process_single_image_task(image, mask, dilation, use_fallback)
+        image_bytes = await target_image.read()
+        mask_bytes = await target_mask.read() if (target_mask and hasattr(target_mask, "read")) else None
+        fname = getattr(target_image, "filename", "image.jpg") or "image.jpg"
+
+        logger.info(f"📥 [SINGLE] Processing '{fname}' ({len(image_bytes)/1024:.1f} KB)...")
+
+        loop = asyncio.get_running_loop()
+        res = await loop.run_in_executor(
+            batch_executor,
+            _sync_clean_worker,
+            image_bytes,
+            mask_bytes,
+            mask_base64,
+            preset,
+            box_x,
+            box_y,
+            box_w,
+            box_h,
+            gain,
+            size_scale,
+            fname
+        )
         return JSONResponse(content={
             "success": True,
-            "width": res["width"],
-            "height": res["height"],
-            "method": res["method"],
-            "inference_seconds": res["inference_seconds"],
-            "elapsed_seconds": res["elapsed_seconds"],
-            "timings": res["timings"],
-            "image_data": res["image_data"]
+            **res
         })
     except Exception as e:
-        logger.exception(f"Error in /process/image: {e}")
+        logger.exception(f"❌ Error processing image: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@router.post("/process/batch")
-async def process_batch(
-    images: List[UploadFile] = File(...),
-    masks: List[UploadFile] = File(...),
-    dilation: int = Form(3),
-    use_fallback: bool = Form(False)
-):
-    """
-    TRUE PARALLEL Bulk Batch Inpainting Endpoint.
-    Dispatches all 1 to 5 images across optimal thread pool.
-    """
-    t_batch_start = time.perf_counter()
-    if len(images) != len(masks):
-        raise HTTPException(
-            status_code=400,
-            detail=f"Mismatched batch: {len(images)} images provided but {len(masks)} masks received."
-        )
 
-    logger.info(f"[BATCH PARALLEL] Dispatching {len(images)} images across executor...")
+@router.post("/image/batch")
+@router.post("/process/batch")
+async def batch_clean_endpoint(request: Request):
+    """
+    Robust Bulk Batch Mathematical Watermark Removal.
+    Uses request.form().getlist(...) to accept 1, 2, 5, or 20 images seamlessly without 422 list errors.
+    """
+    form = await request.form()
+
+    # Extract image and mask lists dynamically
+    target_images = form.getlist("images") or form.getlist("files") or form.getlist("image")
+    if not target_images:
+        logger.error("❌ [400] No images provided in batch request.")
+        raise HTTPException(status_code=400, detail="No images provided for batch processing.")
+
+    target_masks = form.getlist("masks") or form.getlist("mask")
+    preset = form.get("preset")
+
+    def parse_float(val):
+        try:
+            return float(val) if val not in (None, "", "undefined", "null") else None
+        except Exception:
+            return None
+
+    gain = (parse_float(form.get("gain")) if form.get("gain") is not None else -1.0)
+    size_scale = parse_float(form.get("size_scale")) or 1.0
+
+    t_batch_start = time.perf_counter()
+    logger.info(f"📥 [BATCH] Starting batch unblending for {len(target_images)} images...")
     loop = asyncio.get_running_loop()
 
-    # Read all uploaded bytes concurrently
-    read_tasks = [
-        (img.read(), msk.read(), img.filename or f"image_{i+1}.jpg")
-        for i, (img, msk) in enumerate(zip(images, masks))
+    image_contents = [
+        await img.read() if hasattr(img, "read") else b""
+        for img in target_images
     ]
-    
-    async def inpaint_item(img_task, msk_task, filename):
-        img_bytes = await img_task
-        msk_bytes = await msk_task
+    mask_contents = [
+        await m.read() if (m and hasattr(m, "read")) else None
+        for m in target_masks
+    ] if target_masks else [None] * len(target_images)
+
+    # Pad masks list to match image count
+    while len(mask_contents) < len(target_images):
+        mask_contents.append(None)
+
+    async def clean_item(img_bytes, msk_bytes, filename):
         return await loop.run_in_executor(
             batch_executor,
-            _sync_inpaint_worker,
+            _sync_clean_worker,
             img_bytes,
             msk_bytes,
-            filename,
-            dilation,
-            use_fallback
+            None,
+            preset,
+            None,
+            None,
+            None,
+            None,
+            gain,
+            size_scale,
+            filename
         )
 
-    parallel_tasks = [
-        inpaint_item(r[0], r[1], r[2])
-        for r in read_tasks
+    tasks = [
+        clean_item(img_b, msk_b, getattr(img, "filename", f"image_{i+1}.jpg") or f"image_{i+1}.jpg")
+        for i, (img, img_b, msk_b) in enumerate(zip(target_images, image_contents, mask_contents))
     ]
 
-    results = await asyncio.gather(*parallel_tasks, return_exceptions=False)
-
-    total_batch_sec = round(time.perf_counter() - t_batch_start, 2)
-    logger.info(
-        f"[PARALLEL BATCH COMPLETED] All {len(images)} images finished in {total_batch_sec}s total!"
-    )
+    results = await asyncio.gather(*tasks, return_exceptions=False)
+    total_batch_sec = round(time.perf_counter() - t_batch_start, 3)
+    logger.info(f"✅ [BATCH COMPLETED] All {len(target_images)} images unblended in {total_batch_sec*1000:.1f}ms total!")
 
     return JSONResponse(content={
         "success": True,
