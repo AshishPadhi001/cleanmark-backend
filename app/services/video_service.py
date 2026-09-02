@@ -9,11 +9,43 @@ from typing import Optional, Dict, Any, Generator
 import cv2
 import numpy as np
 
-try:
-    import imageio_ffmpeg
-    FFMPEG_EXE = imageio_ffmpeg.get_ffmpeg_exe()
-except Exception:
-    FFMPEG_EXE = "ffmpeg"
+import shutil
+
+def find_ffmpeg_executable() -> str:
+    """
+    Finds a working FFmpeg binary across imageio_ffmpeg, system PATH, or standard Linux/Windows paths.
+    """
+    # 1. Try imageio_ffmpeg standalone binary
+    try:
+        import imageio_ffmpeg
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and os.path.isfile(exe):
+            return exe
+    except Exception:
+        pass
+
+    # 2. Try system PATH
+    which_ffmpeg = shutil.which("ffmpeg")
+    if which_ffmpeg:
+        return which_ffmpeg
+
+    # 3. Try common server / OS paths
+    common_paths = [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/var/task/ffmpeg",
+        "/tmp/ffmpeg",
+        r"C:\ffmpeg\bin\ffmpeg.exe",
+        r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+    ]
+    for p in common_paths:
+        if os.path.isfile(p):
+            return p
+
+    return "ffmpeg"
+
+FFMPEG_EXE = find_ffmpeg_executable()
 
 from app.services.gemini_unblend import gemini_unblend_engine
 from app.services.image_service import image_service
