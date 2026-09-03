@@ -1,3 +1,4 @@
+from app.services.alpha_assets import get_embedded_alpha_96, get_embedded_alpha_48
 import os
 import logging
 from pathlib import Path
@@ -42,26 +43,42 @@ class GeminiUnblendEngine:
         self._load_templates()
 
     def _load_templates(self):
-        if self.bg96_path.exists():
-            img96 = cv2.imread(str(self.bg96_path), cv2.IMREAD_UNCHANGED)
-            if img96 is not None:
-                if len(img96.shape) == 3 and img96.shape[2] >= 3:
-                    self.alpha_96 = np.max(img96[:, :, :3], axis=2).astype(np.float32) / 255.0
-                else:
-                    self.alpha_96 = img96.astype(np.float32) / 255.0
-                logger.info(f"Loaded bg_96.png — alpha_max={self.alpha_96.max():.4f}")
+        # 1. Try loading from disk (multiple possible paths)
+        candidate_dirs = [
+            self.models_dir,
+            Path(__file__).resolve().parent.parent / "models",
+            Path(__file__).resolve().parent.parent.parent / "models",
+            Path("/var/task/models"),
+            Path("/var/task/app/models"),
+        ]
 
-        if self.bg48_path.exists():
-            img48 = cv2.imread(str(self.bg48_path), cv2.IMREAD_UNCHANGED)
-            if img48 is not None:
-                if len(img48.shape) == 3 and img48.shape[2] >= 3:
-                    self.alpha_48 = np.max(img48[:, :, :3], axis=2).astype(np.float32) / 255.0
-                else:
-                    self.alpha_48 = img48.astype(np.float32) / 255.0
-                logger.info(f"Loaded bg_48.png — alpha_max={self.alpha_48.max():.4f}")
+        for c_dir in candidate_dirs:
+            if self.alpha_96 is None and (c_dir / "bg_96.png").exists():
+                img96 = cv2.imread(str(c_dir / "bg_96.png"), cv2.IMREAD_UNCHANGED)
+                if img96 is not None:
+                    if len(img96.shape) == 3 and img96.shape[2] >= 3:
+                        self.alpha_96 = np.max(img96[:, :, :3], axis=2).astype(np.float32) / 255.0
+                    else:
+                        self.alpha_96 = img96.astype(np.float32) / 255.0
+                    logger.info(f"Loaded bg_96.png from {c_dir} — alpha_max={self.alpha_96.max():.4f}")
 
-        if self.alpha_96 is None and self.alpha_48 is None:
-            logger.error("CRITICAL: No alpha templates found in backend/models/!")
+            if self.alpha_48 is None and (c_dir / "bg_48.png").exists():
+                img48 = cv2.imread(str(c_dir / "bg_48.png"), cv2.IMREAD_UNCHANGED)
+                if img48 is not None:
+                    if len(img48.shape) == 3 and img48.shape[2] >= 3:
+                        self.alpha_48 = np.max(img48[:, :, :3], axis=2).astype(np.float32) / 255.0
+                    else:
+                        self.alpha_48 = img48.astype(np.float32) / 255.0
+                    logger.info(f"Loaded bg_48.png from {c_dir} — alpha_max={self.alpha_48.max():.4f}")
+
+        # 2. Serverless / Memory Fallback (Guarantees templates are ALWAYS loaded on Vercel / Cloud)
+        if self.alpha_96 is None:
+            self.alpha_96 = get_embedded_alpha_96()
+            logger.info(f"Loaded bg_96.png from embedded fallback — alpha_max={self.alpha_96.max():.4f}")
+
+        if self.alpha_48 is None:
+            self.alpha_48 = get_embedded_alpha_48()
+            logger.info(f"Loaded bg_48.png from embedded fallback — alpha_max={self.alpha_48.max():.4f}")
 
     def _get_alpha_template(self, size: int) -> Optional[np.ndarray]:
         ref = self.alpha_48 if (size <= 48 and self.alpha_48 is not None) else self.alpha_96
