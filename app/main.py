@@ -22,24 +22,22 @@ logger = logging.getLogger("cleanmark.main")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    import shutil
     settings.init_directories()
     v_dir = settings.STORAGE_DIR / "videos"
     v_dir.mkdir(parents=True, exist_ok=True)
-    # Purge any old video files on startup
-    for item in v_dir.iterdir():
-        try:
-            if item.is_dir():
-                shutil.rmtree(item, ignore_errors=True)
-            else:
-                item.unlink(missing_ok=True)
-        except Exception:
-            pass
-    logger.info("🧹 [STARTUP] Purged all stale video storage on startup.")
+
+    # Clean up only genuinely stale/abandoned sessions on startup (older than 1 hour)
+    try:
+        from app.api.routes_video import cleanup_stale_sessions
+        cleanup_stale_sessions(max_age_seconds=3600)
+        logger.info("🧹 [STARTUP] Stale session garbage collection completed.")
+    except Exception as e:
+        logger.warning(f"Error during startup stale session cleanup: {e}")
+
     logger.info("⚡ [STARTUP] CleanMark Mathematical Engine Initialized (0 Blur, Zero-PyTorch)")
     image_service.initialize_on_startup()
     yield
-    logger.info("🛑 [SHUTDOWN] CleanMark backend stopped.")
+    logger.info("👋 [SHUTDOWN] CleanMark backend stopped.")
 
 app = FastAPI(
     title=settings.PROJECT_NAME,
@@ -71,10 +69,10 @@ async def request_logger_middleware(request: Request, call_next):
     path = request.url.path
     method = request.method
 
-    # Skip logging for health check endpoints (they poll every 15s)
+    # Skip logging for health check endpoints (they poll frequently)
     is_health = path in ("/health", "/api/health")
     if not is_health:
-        logger.info(f"➡️  [{method}] {path} from {client_ip}")
+        logger.info(f"➡️ [{method}] {path} from {client_ip}")
 
     try:
         response = await call_next(request)
@@ -83,20 +81,31 @@ async def request_logger_middleware(request: Request, call_next):
         status_icon = "✅" if code < 400 else "⚠️" if code < 500 else "❌"
         if not is_health:
             logger.info(f"{status_icon} [{code}] {method} {path} | Finished in {elapsed_ms:.2f}ms")
-        logger.info(f"{status_icon} [{code}] {method} {path} | Finished in {elapsed_ms:.2f}ms")
         return response
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - start_time) * 1000
         logger.error(f"❌ [500 INTERNAL ERROR] {method} {path} failed after {elapsed_ms:.2f}ms: {exc}", exc_info=True)
         raise exc
 
-# CORS Configuration
+# CORS Configuration - Strict whitelist & credentials safety
+allowed_origins = [origin for origin in settings.CORS_ORIGINS if origin != "*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.CORS_ORIGINS,
+    allow_origins=allowed_origins,
+    allow_origin_regex=settings.CORS_ORIGIN_REGEX,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
+    allow_headers=[
+        "Content-Type",
+        "Authorization",
+        "Accept",
+        "X-Requested-With",
+        "Range",
+        "Cache-Control",
+    ],
+    expose_headers=["Content-Disposition", "Content-Length", "Content-Range"],
+    max_age=600,
 )
 
 # Mount static storage

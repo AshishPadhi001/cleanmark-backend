@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+from typing import Optional
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
@@ -41,15 +42,19 @@ class Settings(BaseSettings):
     ALLOWED_IMAGE_EXTENSIONS: set = {".png", ".jpg", ".jpeg", ".webp", ".bmp"}
     ALLOWED_VIDEO_EXTENSIONS: set = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
-    # CORS
+    # CORS Whitelisted Origins (Never use '*' with allow_credentials=True)
     CORS_ORIGINS: list[str] = [
         "http://localhost:3000",
         "http://localhost:5173",
         "http://127.0.0.1:3000",
         "http://127.0.0.1:5173",
-        "https://*.vercel.app",
-        "*"
+        "https://cleanmark-website.vercel.app",
+        "https://cleanmark.ai",
+        "https://www.cleanmark.ai",
     ]
+
+    # Regex for matching dynamic Vercel preview URLs
+    CORS_ORIGIN_REGEX: Optional[str] = r"^https:\/\/(cleanmark-[a-zA-Z0-9-]+\.vercel\.app|cleanmark-website\.vercel\.app)$"
 
     def init_directories(self):
         """Ensure all storage and model directories exist gracefully."""
